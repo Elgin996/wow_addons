@@ -156,4 +156,4 @@ MRP 绘制档案窗口、鼠标提示、一眼印象预览框之前，插件先�
 
 ## 许可证
 
-[MIT](LICENSE)
+本项目以 [GNU 通用公共许可证第 3 版（GPLv3）](LICENSE)发布，与 MyRolePlay 一致。界面汉化文件 `Locale_MRP_zhCN.lua` 翻译自 MyRolePlay 的界面文字。

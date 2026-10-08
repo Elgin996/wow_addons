@@ -2,6 +2,7 @@
 ## Title: |cffffc1fbMRP|r 档案翻译
 ## Notes: 把 MyRolePlay 档案翻译成简体中文，并汉化 MRP 界面。翻译需配合桌面剪贴板助手（MRP_Translate_Helper）使用。
 ## Version: 0.2.0
+## X-License: GPLv3
 ## Dependencies: MyRolePlay
 ## SavedVariables: MRPTR_DB
 

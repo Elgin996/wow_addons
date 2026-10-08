@@ -156,4 +156,4 @@ Body text, with markup replaced by {{1}}, {{2}} … placeholders
 
 ## License
 
-[MIT](LICENSE)
+Released under the [GNU General Public License v3 (GPLv3)](LICENSE), the same license as MyRolePlay. The interface localization file `Locale_MRP_zhCN.lua` is a translation of MyRolePlay's interface strings.
