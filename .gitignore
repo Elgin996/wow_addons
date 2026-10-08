@@ -1,0 +1,10 @@
+# 别人的插件，只放在本地参考，不进仓库
+/MyRolePlay/
+/WoWTranslator/
+/ChatTranslator/
+
+# 剪贴板助手运行时生成的文件
+MRP_Translate_Helper/cache.json
+MRP_Translate_Helper/names.json
+*.tmp
+__pycache__/

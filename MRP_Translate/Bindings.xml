@@ -1,0 +1,5 @@
+<Bindings>
+    <Binding name="MRPTR_TRANSLATE_QUEUE" header="MRPTR" category="ADDONS">
+        MRPTR_TranslateQueue()
+    </Binding>
+</Bindings>

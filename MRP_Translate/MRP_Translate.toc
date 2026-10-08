@@ -1,0 +1,10 @@
+## Interface: 120100, 50504, 20506, 11509
+## Title: |cffffc1fbMRP|r 档案翻译
+## Notes: 把 MyRolePlay 档案翻译成简体中文，并汉化 MRP 界面。翻译需配合桌面剪贴板助手（MRP_Translate_Helper）使用。
+## Version: 0.2.0
+## Dependencies: MyRolePlay
+## SavedVariables: MRPTR_DB
+
+Locale_MRP_zhCN.lua
+Core.lua
+UI.lua

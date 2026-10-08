@@ -1,0 +1,13 @@
+{
+  "provider": "gemini",
+  "gemini": {
+    "model": "gemini-3.8-flash",
+    "api_key": ""
+  },
+  "openrouter": {
+    "model": "google/gemini-3.8-flash",
+    "api_key": ""
+  },
+  "timeout_seconds": 180,
+  "beep": true
+}
