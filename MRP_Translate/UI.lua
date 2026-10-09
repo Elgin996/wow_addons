@@ -78,6 +78,12 @@ local function Scan(player, keys)
     return pending, done
 end
 
+-- 按过 Ctrl+C 发给助手、译文还没粘贴回来的档案。player 要先过 Key()。
+local function Sent(player)
+    local job = player and MRPTR_DB.jobs[player]
+    return job and job.sent and type(job.fields) == "table" and next(job.fields) ~= nil
+end
+
 local function CleanName(name)
     if not name or name == "" then return nil end
     name = gsub(name, "|+c%x%x%x%x%x%x%x%x", "")
@@ -192,9 +198,26 @@ end
 -- ------------------------------------------
 -- 档案窗口上的按钮
 -- ------------------------------------------
--- MRP 窗口默认只有 338 像素宽，标题行居中，按钮放在里面会挡字，所以贴在窗口右侧外沿。
+-- MRP 窗口默认只有 338 像素宽，标题行居中，按钮放在里面会挡字；左右外沿是一眼印象图标栏，
+-- 所以接在底边「外貌/性格/传记」标签页的右边，排成一行。
 
 local translateButton, toggleButton
+
+-- 档案窗口开着时，按 F1 等于点「翻译 / 粘贴」按钮；窗口关掉后 F1 恢复原来的功能（默认是选中自己）。
+-- 想换键就改这里。战斗中不允许改键位，所以战斗里打开的档案要等脱战后 F1 才生效。
+local HOTKEY = "F1"
+local hotkeyOwner = CreateFrame("Frame")
+
+local function SyncHotkey()
+    if InCombatLockdown() then return end
+    ClearOverrideBindings(hotkeyOwner)
+    local bf = MyRolePlayBrowseFrame
+    if HOTKEY and translateButton and bf and bf:IsShown() then
+        SetOverrideBindingClick(hotkeyOwner, true, HOTKEY, "MRPTR_TranslateButton")
+    end
+end
+hotkeyOwner:RegisterEvent("PLAYER_REGEN_ENABLED")
+hotkeyOwner:SetScript("OnEvent", SyncHotkey)
 
 local function MakeButton(name, parent, text)
     local button = CreateFrame("Button", name, parent, "UIPanelButtonTemplate")
@@ -204,8 +227,16 @@ local function MakeButton(name, parent, text)
 end
 
 local function ShowTranslateTooltip(self)
-    local pending, done = Scan(Key(mrp.BFShown))
+    local player = Key(mrp.BFShown)
+    local pending, done = Scan(player)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    if #pending > 0 and Sent(player) then
+        GameTooltip:SetText("粘贴译文", 1, 0.82, 0)
+        GameTooltip:AddLine("这份档案已经发给助手了。听到提示音后点这里，再按 Ctrl+V；其他翻好的档案会一起写入。", 1, 1, 1, true)
+        GameTooltip:AddLine("快捷键：" .. HOTKEY, 0.7, 0.7, 0.7, true)
+        GameTooltip:Show()
+        return
+    end
     GameTooltip:SetText("翻译这份档案", 1, 0.82, 0)
     if #pending > 0 then
         GameTooltip:AddLine("待翻译：" .. Labels(pending), 1, 1, 1, true)
@@ -216,6 +247,7 @@ local function ShowTranslateTooltip(self)
         GameTooltip:AddLine(("已有译文的字段：%d 个"):format(done), 0.7, 0.7, 0.7, true)
     end
     GameTooltip:AddLine("档案可能还在加载，之后新收到的字段可以再点一次补译。", 0.7, 0.7, 0.7, true)
+    GameTooltip:AddLine("快捷键：" .. HOTKEY, 0.7, 0.7, 0.7, true)
     GameTooltip:Show()
 end
 
@@ -239,13 +271,12 @@ local function EnsureButtons(bf)
     if translateButton then return end
 
     translateButton = MakeButton("MRPTR_TranslateButton", bf, "翻译")
-    translateButton:SetPoint("TOPLEFT", bf, "TOPRIGHT", 2, -30)
     translateButton:SetScript("OnClick", function() ns.StartRequest(Key(mrp.BFShown)) end)
     translateButton:SetScript("OnEnter", ShowTranslateTooltip)
     translateButton:SetScript("OnLeave", GameTooltip_Hide)
 
     toggleButton = MakeButton("MRPTR_ToggleButton", bf, "原文")
-    toggleButton:SetPoint("TOP", translateButton, "BOTTOM", 0, -4)
+    toggleButton:SetPoint("LEFT", translateButton, "RIGHT", 4, 0)
     toggleButton:SetScript("OnClick", function()
         MRPTR_DB.showTranslated = not Showing()
         RefreshDisplays(nil)
@@ -257,11 +288,36 @@ local function EnsureButtons(bf)
         GameTooltip:Show()
     end)
     toggleButton:SetScript("OnLeave", GameTooltip_Hide)
+
+    bf:HookScript("OnShow", SyncHotkey)
+    bf:HookScript("OnHide", SyncHotkey)
+    SyncHotkey()
+end
+
+-- 旧版标签页模板两端各有约 15 像素透明边，MRP 自己排标签页时也是叠 -15。
+local TAB_GAP = (C_XMLUtil and C_XMLUtil.GetTemplateInfo
+    and C_XMLUtil.GetTemplateInfo("CharacterFrameTabTemplate")) and 4 or -11
+
+-- 标签页宽度随文字变，「性格」「传记」还能在 MRP 设置里隐藏，所以每次刷新都重新找最后一个可见的。
+local function AnchorButtons(bf)
+    translateButton:ClearAllPoints()
+    for i = 3, 1, -1 do
+        local tab = _G["MyRolePlayBrowseFrameTab" .. i]
+        if tab and tab:IsShown() then
+            translateButton:SetPoint("LEFT", tab, "RIGHT", TAB_GAP, 0)
+            return
+        end
+    end
+    translateButton:SetPoint("TOPLEFT", bf, "BOTTOMLEFT", 11, -2)
 end
 
 local function UpdateButtons(player)
     local pending, done = Scan(player)
-    translateButton:SetText(done > 0 and "补译" or "翻译")
+    if #pending > 0 and Sent(Key(player)) then
+        translateButton:SetText("粘贴")
+    else
+        translateButton:SetText(done > 0 and "补译" or "翻译")
+    end
     translateButton:SetEnabled(#pending > 0)
     if done > 0 then
         toggleButton:SetText(Showing() and "原文" or "中文")
@@ -314,8 +370,8 @@ end
 local copyFrame
 
 local STATUS_COLORS = {
-    info = { 0.8, 0.8, 0.8 },
-    warn = { 1, 0.82, 0 },
+    info = { 1, 0.82, 0 },
+    warn = { 1, 0.6, 0.2 },
     error = { 1, 0.3, 0.3 },
 }
 
@@ -323,6 +379,7 @@ local function SetStatus(text, level)
     local color = STATUS_COLORS[level] or STATUS_COLORS.info
     copyFrame.status:SetText(text)
     copyFrame.status:SetTextColor(color[1], color[2], color[3])
+    copyFrame:SetHeight(copyFrame.status:GetStringHeight() + 34)
 end
 
 local function SelectAll()
@@ -330,76 +387,90 @@ local function SelectAll()
     copyFrame.edit:HighlightText()
 end
 
-local function CreateCopyFrame()
-    local template = "BasicFrameTemplateWithInset"
-    if DoesTemplateExist and not DoesTemplateExist(template) then
-        template = "ButtonFrameTemplate"
-    end
+local MODIFIER_KEYS = {
+    LSHIFT = true, RSHIFT = true, LCTRL = true, RCTRL = true,
+    LALT = true, RALT = true, LMETA = true, RMETA = true,
+    SHIFT = true, CTRL = true, ALT = true, META = true,
+}
 
-    local f = CreateFrame("Frame", "MRPTR_CopyFrame", UIParent, template)
-    f:SetSize(520, 400)
-    f:SetPoint("CENTER")
+-- 插件写不了剪贴板，只能把请求放进输入框选中，由玩家按 Ctrl+C。请求原文没必要给人看，
+-- 所以这里只是按钮下面的一条小提示，输入框只露一行；按完 Ctrl+C / Ctrl+V 就自己收起。
+local function CreateCopyFrame()
+    local f = CreateFrame("Frame", "MRPTR_CopyFrame", UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
+    f:SetSize(260, 50)
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
-    f:SetMovable(true)
     f:EnableMouse(true)
-    f:RegisterForDrag("LeftButton")
-    f:SetScript("OnDragStart", f.StartMoving)
-    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 },
+    })
+    f:SetBackdropColor(0, 0, 0, 0.9)
+    f:Hide()
     tinsert(UISpecialFrames, "MRPTR_CopyFrame") -- Esc 关闭
 
-    f.title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    f.title:SetPoint("TOP", 0, -5)
+    f.status = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    f.status:SetPoint("TOPLEFT", 10, -9)
+    f.status:SetPoint("TOPRIGHT", -10, -9)
+    f.status:SetJustifyH("LEFT")
 
-    f.help = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    f.help:SetPoint("TOPLEFT", 16, -34)
-    f.help:SetPoint("TOPRIGHT", -16, -34)
-    f.help:SetJustifyH("LEFT")
-    f.help:SetText("① 按 Ctrl+C 复制下面已选中的内容\n② 等剪贴板助手响提示音\n③ 回到这里按 Ctrl+V 粘贴译文")
+    -- 输入框必须显示着、有焦点、文字选中，Ctrl+C 才复制得到；外面套一层只露一行
+    local clip = CreateFrame("Frame", nil, f)
+    clip:SetPoint("BOTTOMLEFT", 10, 8)
+    clip:SetPoint("BOTTOMRIGHT", -10, 8)
+    clip:SetHeight(14)
+    if clip.SetClipsChildren then clip:SetClipsChildren(true) end
+    clip:EnableMouse(true)
+    clip:SetScript("OnMouseDown", SelectAll)
 
-    local scroll = CreateFrame("ScrollFrame", "MRPTR_CopyScroll", f, "UIPanelScrollFrameTemplate")
-    scroll:SetPoint("TOPLEFT", 16, -92)
-    scroll:SetPoint("BOTTOMRIGHT", -34, 46)
-
-    local edit = CreateFrame("EditBox", "MRPTR_CopyEditBox", scroll)
+    local edit = CreateFrame("EditBox", "MRPTR_CopyEditBox", clip)
     edit:SetMultiLine(true)
     edit:SetAutoFocus(false)
-    edit:SetFontObject(ChatFontNormal)
-    edit:SetWidth(460)
-    -- 第一下 Esc 只是让出键盘（好让人物能动），窗口和内容都还在；再按一下才关窗口。
-    -- 之后点回文本框会自动全选，直接 Ctrl+V 就行；就算没全选，译文插在中间也认得出来。
-    edit:SetScript("OnEscapePressed", edit.ClearFocus)
+    edit:SetFontObject(GameFontDisableSmall)
+    edit:SetPoint("TOPLEFT")
+    edit:SetPoint("TOPRIGHT")
+    edit:SetScript("OnEscapePressed", function() f:Hide() end)
     edit:SetScript("OnEditFocusGained", edit.HighlightText)
-    edit:SetScript("OnEditFocusLost", function()
-        SetStatus("要粘贴译文时，先点一下文本框，再按 Ctrl+V。", "info")
-    end)
     edit:SetScript("OnTextChanged", function(self, userInput)
         if userInput then ns.HandlePaste(self:GetText()) end
     end)
-    scroll:SetScrollChild(edit)
-    scroll:SetScript("OnSizeChanged", function(_, width) edit:SetWidth(width) end)
-    -- 文字下方的空白处也能点：点一下就重新全选，方便接着按 Ctrl+C 或 Ctrl+V
-    scroll:EnableMouse(true)
-    scroll:SetScript("OnMouseDown", SelectAll)
+    edit:SetScript("OnKeyDown", function(_, key)
+        local ctrl = IsControlKeyDown() or (IsMetaKeyDown and IsMetaKeyDown())
+        if ctrl and key == "C" then
+            -- 按下 C 时 Ctrl 一定还按着，松键先后因人而异，所以在这里判断。
+            -- 复制在这次按键里才完成，稍等一下再收起，免得把输入框提前收掉。
+            local players = f.players
+            C_Timer.After(0.1, function()
+                ns.MarkSent(players)
+                if f.players == players then f:Hide() end
+            end)
+        elseif not ctrl and not MODIFIER_KEYS[key] then
+            -- 按了别的键（多半是想走路）：收起提示，把键盘还给游戏
+            f:Hide()
+        end
+    end)
     f.edit = edit
 
-    f.status = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    f.status:SetPoint("BOTTOMLEFT", 16, 18)
-    f.status:SetPoint("RIGHT", -110, 0)
-    f.status:SetJustifyH("LEFT")
-
-    f.select = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    f.select:SetSize(84, 22)
-    f.select:SetPoint("BOTTOMRIGHT", -16, 12)
-    f.select:SetText("重新全选")
-    f.select:SetScript("OnClick", SelectAll)
-
+    f:SetScript("OnHide", function() edit:ClearFocus() end)
     copyFrame = f
 end
 
-local function ShowCopyFrame(title, packed, status)
+local function ShowCopyFrame(packed, status, players)
     if not copyFrame then CreateCopyFrame() end
-    copyFrame.title:SetText(title)
+    copyFrame.players = players
+    copyFrame:ClearAllPoints()
+    if translateButton and translateButton:IsVisible() then
+        copyFrame:SetPoint("TOPLEFT", translateButton, "BOTTOMLEFT", 0, -2)
+        if not copyFrame.followsButton then
+            -- 档案窗口关掉时提示也跟着收起，不留在半空
+            translateButton:HookScript("OnHide", function() copyFrame:Hide() end)
+            copyFrame.followsButton = true
+        end
+    else
+        copyFrame:SetPoint("TOP", UIParent, "TOP", 0, -120)
+    end
     copyFrame.edit:SetText(packed)
     copyFrame.edit:SetCursorPosition(0)
     SetStatus(status, "info")
@@ -430,16 +501,35 @@ function ns.StartRequest(player)
         Print("这份档案没有需要翻译的内容。")
         return
     end
+    local status = Sent(player)
+        and "按 Ctrl+V 粘贴译文（没听到提示音的话，按 Ctrl+C 重发）"
+        or "按 Ctrl+C 发给翻译助手"
     local packed = ns.Pack({ BuildBlock(player, pending) })
-    ShowCopyFrame("MRP 档案翻译 · " .. Short(player), packed, "待翻译：" .. Labels(pending))
+    ShowCopyFrame(packed, status, { player })
+end
+
+function ns.MarkSent(players)
+    local names = {}
+    for _, player in ipairs(players or {}) do
+        local job = MRPTR_DB.jobs[player]
+        if job then
+            job.sent = time()
+            names[#names + 1] = Short(player)
+        end
+    end
+    if #names == 0 then return end
+    local who = #names <= 3 and table.concat(names, "、") or ("%d 人"):format(#names)
+    Print(("已发给助手：%s。不用等，听到提示音后打开档案点「粘贴」，按 Ctrl+V。"):format(who))
+    if translateButton and mrp.BFShown then UpdateButtons(mrp.BFShown) end
 end
 
 function ns.StartQueueRequest()
-    local blocks = {}
+    local blocks, players = {}, {}
     for _, player in ipairs({ unpack(queueOrder) }) do
         local pending = Scan(player, ns.QUEUE_FIELDS)
         if #pending > 0 then
             blocks[#blocks + 1] = BuildBlock(player, pending)
+            players[#players + 1] = player
         else
             RemoveFromQueue(player) -- 已经在别处翻过了
         end
@@ -448,8 +538,7 @@ function ns.StartQueueRequest()
         Print("翻译队列是空的：鼠标扫过有 RP 档案的玩家后，他们的状态会自动排进来。")
         return
     end
-    ShowCopyFrame(("翻译队列 · %d 人"):format(#blocks), ns.Pack(blocks),
-        ("鼠标提示里的头衔、当前状态、场外信息和一眼印象，共 %d 人。"):format(#blocks))
+    ShowCopyFrame(ns.Pack(blocks), ("按 Ctrl+C 把 %d 人的鼠标提示发给翻译助手"):format(#blocks), players)
 end
 
 function MRPTR_TranslateQueue()
@@ -481,18 +570,22 @@ function ns.HandlePaste(text)
     end
 
     local single = #parsed.players == 1
-    local savedPlayers, savedFields, refresh = 0, 0, {}
+    local savedPlayers, savedFields, savedNames, alreadyPlayers, refresh = 0, 0, {}, 0, {}
     for _, block in ipairs(parsed.players) do
-        local saved, stale, broken = ns.ApplyResponse(block, CurrentOriginal)
+        local saved, stale, broken, already = ns.ApplyResponse(block, CurrentOriginal)
         local who = block.player and block.player ~= "" and Short(block.player) or "?"
         if #saved > 0 then
             savedPlayers = savedPlayers + 1
             savedFields = savedFields + #saved
+            savedNames[#savedNames + 1] = who
             refresh[block.player] = true
             RemoveFromQueue(block.player)
             if single then
                 Print(("已保存 %s 的译文：%s"):format(who, Labels(saved)))
             end
+        elseif #already > 0 then
+            alreadyPlayers = alreadyPlayers + 1
+            RemoveFromQueue(block.player)
         end
         if #stale > 0 then
             Print(("%s 的这些字段在翻译期间被改过，需要重新翻译：%s"):format(who, Labels(stale)))
@@ -505,13 +598,17 @@ function ns.HandlePaste(text)
         end
     end
     if not single and savedPlayers > 0 then
-        Print(("已保存 %d 人、%d 个字段的译文。"):format(savedPlayers, savedFields))
+        Print(("已保存 %d 人、%d 个字段的译文：%s"):format(savedPlayers, savedFields, table.concat(savedNames, "、")))
     end
 
     if savedPlayers > 0 then
         MRPTR_DB.showTranslated = true
         copyFrame:Hide()
         RefreshDisplays(refresh)
+        if translateButton and mrp.BFShown then UpdateButtons(mrp.BFShown) end
+    elseif alreadyPlayers > 0 then
+        Print("剪贴板里的译文之前都已经粘贴过了。")
+        copyFrame:Hide()
     else
         SetStatus("没有可用的译文，详情见聊天框。", "error")
     end
@@ -525,6 +622,7 @@ local function AfterBrowseFrame(player)
     local bf = MyRolePlayBrowseFrame
     if not bf or not player then return end
     EnsureButtons(bf)
+    AnchorButtons(bf)
     UpdateButtons(player)
 end
 

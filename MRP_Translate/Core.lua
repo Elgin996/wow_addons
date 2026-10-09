@@ -445,17 +445,24 @@ end
 
 -- 按字段核对哈希、还原标记、写入缓存。block 是 Parse 结果里的一个玩家。
 -- currentOriginal(player, key) 返回 MRP 当前收到的原文，用于 jobs 里没有的情况。
--- 返回三张表：已保存、档案已变（哈希对不上）、占位符不符。
+-- 返回四张表：已保存、档案已变（哈希对不上）、占位符不符、之前已粘贴过。
+-- 助手每次都把一小时内翻好的译文整批带上，所以同一段译文可能粘贴好几次，已有的直接跳过。
 function ns.ApplyResponse(block, currentOriginal)
-    local saved, stale, broken = {}, {}, {}
+    local saved, stale, broken, already = {}, {}, {}, {}
     local player = block.player
-    if not player or player == "" then return saved, stale, broken end
+    if not player or player == "" then return saved, stale, broken, already end
     local job = MRPTR_DB.jobs[player]
 
     for _, field in ipairs(block.fields) do
         local original
         local fromJob = job and job.fields and job.fields[field.key]
-        if fromJob and ns.Hash(fromJob) == field.hash then
+        local entry = MRPTR_DB.cache[player]
+        local have = entry and entry.fields and entry.fields[field.key]
+        local dup = have and have.h == field.hash
+        if dup then
+            already[#already + 1] = field.key
+            if fromJob and ns.Hash(fromJob) == field.hash then job.fields[field.key] = nil end
+        elseif fromJob and ns.Hash(fromJob) == field.hash then
             original = fromJob
         else
             local current = currentOriginal(player, field.key)
@@ -464,7 +471,9 @@ function ns.ApplyResponse(block, currentOriginal)
             end
         end
 
-        if not original then
+        if dup then
+            -- 上面已经记进 already
+        elseif not original then
             stale[#stale + 1] = field.key
         else
             local _, tokens = ns.ProtectField(field.key, original)
@@ -482,5 +491,5 @@ function ns.ApplyResponse(block, currentOriginal)
     if job and job.fields and next(job.fields) == nil then
         MRPTR_DB.jobs[player] = nil
     end
-    return saved, stale, broken
+    return saved, stale, broken, already
 end

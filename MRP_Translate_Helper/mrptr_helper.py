@@ -1,7 +1,8 @@
 """MRP 档案翻译 · 剪贴板助手
 
 配合魔兽世界插件 MRP_Translate 使用：在游戏里点「翻译」并按 Ctrl+C 后，本程序从剪贴板
-读到翻译请求，调用翻译接口，再把译文写回剪贴板；听到提示音后回游戏按 Ctrl+V。
+读到翻译请求，在后台调用翻译接口，翻好后把译文写回剪贴板并响提示音。不用在游戏里干等：
+可以接着翻别的档案，之后打开其中任意一份点「粘贴」、按 Ctrl+V，翻好的档案一次全部写入。
 
 只处理以 <<MRPTR1 REQ>> 开头的剪贴板内容，你复制的其他东西不会被发送到任何地方。
 
@@ -19,8 +20,10 @@ import argparse
 import ctypes
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -52,10 +55,11 @@ LOOSE_PLACEHOLDER = re.compile(r"[{｛]\s*[{｛]\s*(\d+)\s*[}｝]\s*[}｝]")
 
 DEFAULT_CONFIG = {
     "provider": "gemini",
-    "gemini": {"model": "gemini-3.8-flash", "api_key": ""},
+    "gemini": {"model": "gemini-3.8-flash", "api_key": "", "thinking_level": "low"},
     "openrouter": {"model": "google/gemini-3.8-flash", "api_key": ""},
     "timeout_seconds": 180,
     "beep": True,
+    "hotkeys": {"copy": "F2", "paste": "F3"},
 }
 
 API_KEY_ENV = {"gemini": "GEMINI_API_KEY", "openrouter": "OPENROUTER_API_KEY"}
@@ -320,15 +324,20 @@ def response_schema(upper: bool) -> dict:
 
 
 class GeminiTranslator:
-    def __init__(self, model: str, api_key: str, system_prompt: str, timeout: float):
+    def __init__(self, model: str, api_key: str, system_prompt: str, timeout: float, thinking_level: str = ""):
         self.model, self.api_key, self.system_prompt, self.timeout = model, api_key, system_prompt, timeout
-        self.label = f"Gemini · {model}"
+        self.thinking_level = thinking_level
+        self.label = f"Gemini · {model}" + (f" · 思考 {thinking_level}" if thinking_level else "")
 
     def translate(self, items: list[dict], known_names: dict[str, str]) -> tuple[dict, str]:
+        generation_config = {"responseMimeType": "application/json", "responseSchema": response_schema(True)}
+        # 不设时模型自己决定思考多久，同一份档案可能思考上万 token、要等一分多钟；翻译用 low 就够了
+        if self.thinking_level:
+            generation_config["thinkingConfig"] = {"thinkingLevel": self.thinking_level}
         body = {
             "systemInstruction": {"parts": [{"text": self.system_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": build_user_message(items, known_names)}]}],
-            "generationConfig": {"responseMimeType": "application/json", "responseSchema": response_schema(True)},
+            "generationConfig": generation_config,
         }
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         data = post_json(url, body, {"x-goog-api-key": self.api_key}, self.timeout)
@@ -431,8 +440,10 @@ def make_translator(config: dict):
 
     system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
     timeout = float(config.get("timeout_seconds", DEFAULT_CONFIG["timeout_seconds"]))
-    cls = GeminiTranslator if provider == "gemini" else OpenRouterTranslator
-    return cls(model, api_key, system_prompt, timeout)
+    if provider == "gemini":
+        thinking_level = section.get("thinking_level", DEFAULT_CONFIG["gemini"]["thinking_level"])
+        return GeminiTranslator(model, api_key, system_prompt, timeout, thinking_level or "")
+    return OpenRouterTranslator(model, api_key, system_prompt, timeout)
 
 
 def cache_key(player: str, key: str, hash_: str) -> str:
@@ -541,6 +552,136 @@ def load_cache() -> dict:
 
 
 # ------------------------------------------------------------------
+# 单键复制粘贴：魔兽窗口在前台时，把 F2 / F3 换成 Ctrl+C / Ctrl+V
+# ------------------------------------------------------------------
+# 和改键软件一样，一次按键只换成一次按键；按住不放不会连发，其他程序里 F2 / F3 不受影响。
+
+WOW_EXES = {"wow.exe", "wowclassic.exe", "wowt.exe", "wowb.exe", "wowclassict.exe", "wowclassicb.exe"}
+VK_CONTROL, VK_C, VK_V = 0x11, 0x43, 0x56
+
+
+def parse_key(name: str) -> int | None:
+    """目前只支持功能键 F1–F24。"""
+    match = re.fullmatch(r"[Ff]([1-9]|1[0-9]|2[0-4])", (name or "").strip())
+    return 0x70 + int(match.group(1)) - 1 if match else None
+
+
+def start_key_remap(config: dict) -> None:
+    hotkeys = config.get("hotkeys", DEFAULT_CONFIG["hotkeys"]) or {}
+    mapping, shown = {}, []
+    for action, target in (("copy", VK_C), ("paste", VK_V)):
+        name = hotkeys.get(action, "")
+        if not name:
+            continue
+        vk = parse_key(name)
+        if vk is None:
+            log(f"config.json 里 hotkeys.{action} 的「{name}」认不出来，只支持 F1–F24，这个键没启用。")
+            continue
+        mapping[vk] = target
+        shown.append(f"{name.upper()} = Ctrl+{'C' if target == VK_C else 'V'}")
+    if not mapping:
+        return
+    threading.Thread(target=_key_remap_loop, args=(mapping,), daemon=True).start()
+    log(f"魔兽窗口在前台时：{'，'.join(shown)}（在 config.json 的 hotkeys 里可以改，留空就关掉）。")
+
+
+def _key_remap_loop(mapping: dict[int, int]) -> None:
+    from ctypes import wintypes as w
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    LRESULT = ctypes.c_ssize_t
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", w.DWORD), ("scanCode", w.DWORD), ("flags", w.DWORD),
+                    ("time", w.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", w.WORD), ("wScan", w.WORD), ("dwFlags", w.DWORD),
+                    ("time", w.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class MOUSEINPUT(ctypes.Structure):  # 只为了让 INPUT 的大小和系统一致
+        _fields_ = [("dx", w.LONG), ("dy", w.LONG), ("mouseData", w.DWORD), ("dwFlags", w.DWORD),
+                    ("time", w.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class INPUT(ctypes.Structure):
+        class _U(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT)]
+        _anonymous_ = ("u",)
+        _fields_ = [("type", w.DWORD), ("u", _U)]
+
+    HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, w.WPARAM, w.LPARAM)
+    user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, w.HINSTANCE, w.DWORD]
+    user32.SetWindowsHookExW.restype = ctypes.c_void_p
+    user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, w.WPARAM, w.LPARAM]
+    user32.CallNextHookEx.restype = LRESULT
+    user32.GetForegroundWindow.restype = w.HWND
+    user32.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
+    user32.SendInput.argtypes = [w.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.MapVirtualKeyW.argtypes = [w.UINT, w.UINT]
+    user32.GetMessageW.argtypes = [ctypes.POINTER(w.MSG), w.HWND, w.UINT, w.UINT]
+    kernel32.GetModuleHandleW.restype = w.HMODULE
+    kernel32.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+    kernel32.OpenProcess.restype = w.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)]
+    kernel32.CloseHandle.argtypes = [w.HANDLE]
+
+    WH_KEYBOARD_LL, LLKHF_INJECTED, KEYEVENTF_KEYUP = 13, 0x10, 0x0002
+    KEY_DOWN, KEY_UP = (0x100, 0x104), (0x101, 0x105)
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    def wow_in_front() -> bool:
+        pid = w.DWORD()
+        user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(pid))
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not handle:
+            return False
+        try:
+            buffer, size = ctypes.create_unicode_buffer(1024), w.DWORD(1024)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return False
+            return os.path.basename(buffer.value).lower() in WOW_EXES
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def key(vk: int, up: bool) -> INPUT:
+        event = INPUT(type=1)
+        event.ki = KEYBDINPUT(wVk=vk, wScan=user32.MapVirtualKeyW(vk, 0), dwFlags=KEYEVENTF_KEYUP if up else 0)
+        return event
+
+    def send_ctrl(vk: int) -> None:
+        events = (INPUT * 4)(key(VK_CONTROL, False), key(vk, False), key(vk, True), key(VK_CONTROL, True))
+        user32.SendInput(4, events, ctypes.sizeof(INPUT))
+
+    held: set[int] = set()
+
+    def on_key(code, w_param, l_param):
+        if code == 0:
+            info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            target = mapping.get(info.vkCode)
+            if target and not info.flags & LLKHF_INJECTED:
+                if w_param in KEY_DOWN:
+                    if info.vkCode in held:
+                        return 1  # 按住不放时的自动重复，吞掉不发
+                    if wow_in_front():
+                        held.add(info.vkCode)
+                        send_ctrl(target)
+                        return 1
+                elif w_param in KEY_UP and info.vkCode in held:
+                    held.discard(info.vkCode)
+                    return 1
+        return user32.CallNextHookEx(None, code, w_param, l_param)
+
+    proc = HOOKPROC(on_key)  # 留着引用，免得被回收
+    if not user32.SetWindowsHookExW(WH_KEYBOARD_LL, proc, kernel32.GetModuleHandleW(None), 0):
+        log(f"单键复制粘贴没能启用（错误码 {ctypes.get_last_error()}），照常用 Ctrl+C / Ctrl+V 就行。")
+        return
+    msg = w.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        pass
+
+
+# ------------------------------------------------------------------
 # Windows 剪贴板
 # ------------------------------------------------------------------
 
@@ -629,6 +770,55 @@ class Clipboard:
 # 主循环
 # ------------------------------------------------------------------
 
+POOL_TTL_SECONDS = 3600
+MAX_POOL_PLAYERS = 40
+
+
+class ReadyPool:
+    """翻好的译文先放这里，每次写剪贴板都把整池带上。
+
+    这样连着翻几份档案时，后一份不会把前一份挤掉，回游戏粘贴一次就全拿到。
+    不知道游戏里粘贴过没有，所以只按时间清理；重复粘贴同一段译文，插件会跳过。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.players: dict[str, dict] = {}  # 玩家 -> {"name", "at", "fields": {字段: (哈希, 译文)}}
+
+    def add(self, blocks: list[Block], translated: dict) -> None:
+        now = time.time()
+        with self.lock:
+            for block in blocks:
+                for f in block.fields:
+                    text = translated.get((block.player, f.key))
+                    if text is None:
+                        continue
+                    entry = self.players.setdefault(block.player, {"name": block.name, "fields": {}})
+                    entry["name"] = block.name or entry["name"]
+                    entry["at"] = now
+                    entry["fields"][f.key] = (f.hash, text)
+            self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        for player in [p for p, e in self.players.items() if now - e["at"] > POOL_TTL_SECONDS]:
+            del self.players[player]
+        while len(self.players) > MAX_POOL_PLAYERS:
+            del self.players[min(self.players, key=lambda p: self.players[p]["at"])]
+
+    def response(self) -> tuple[str, list[str]]:
+        """返回要写进剪贴板的整池译文，以及其中各人的显示名。"""
+        with self.lock:
+            self._prune(time.time())
+            blocks, translated = [], {}
+            for player, entry in self.players.items():
+                block = Block(player, entry["name"])
+                for key, (hash_, text) in entry["fields"].items():
+                    block.fields.append(Field(key, hash_, ""))
+                    translated[(player, key)] = text
+                blocks.append(block)
+            return format_response(blocks, translated, {}), [b.display_name for b in blocks]
+
+
 def beep(config: dict, ok: bool) -> None:
     if not config.get("beep", True):
         return
@@ -636,59 +826,34 @@ def beep(config: dict, ok: bool) -> None:
     winsound.MessageBeep(winsound.MB_OK if ok else winsound.MB_ICONHAND)
 
 
-def respond(clipboard: Clipboard, config: dict, request_text: str, response: str, ok: bool) -> None:
-    # 等待期间你可能复制了别的东西，那就不要覆盖它
-    if clipboard.read_text() != request_text:
-        if ok:
-            log("剪贴板在翻译期间变了，没有覆盖。译文已缓存：回游戏点「重新全选」再按一次 Ctrl+C，马上就能拿到。")
-        else:
-            log("剪贴板在处理期间变了，没有写入错误信息。")
-        return
-    try:
-        clipboard.write_text(response)
-    except ClipboardError as error:
-        log(f"写回剪贴板失败：{error}")
-        return
-    beep(config, ok)
-    log("已写入剪贴板，回游戏按 Ctrl+V。" if ok else "错误信息已写入剪贴板。")
+def is_ours(text: str | None) -> bool:
+    """剪贴板里是不是本程序的东西（请求、译文、报错）。不是的话就是你自己复制的，不能覆盖。"""
+    if not text:
+        return True
+    head = text.lstrip()
+    return head.startswith((HEADER_REQ, HEADER_RES, HEADER_ERR))
 
 
-class Stats:
-    done = 0
-    last_error = ""
-
-    def idle_title(self) -> str:
-        title = f"等待中（已完成 {self.done} 份）"
-        if self.last_error:
-            title += f" · 上次失败：{self.last_error}"
-        return title
-
-
-def handle(clipboard: Clipboard, config: dict, translator, cache: dict, stats: Stats, text: str) -> None:
+def handle(config: dict, translator, cache: dict, pool: ReadyPool, outbox: queue.Queue, text: str) -> None:
+    """在后台线程里跑：翻译一份请求，结果放进 pool，再通知主线程写剪贴板。"""
     started = time.monotonic()
     try:
         blocks = parse_request(text)
     except ProtocolError as error:
         log(f"请求格式有误：{error}")
-        respond(clipboard, config, text, format_error(str(error)), ok=False)
+        outbox.put(("error", str(error)))
         return
 
     total = sum(len(b.fields) for b in blocks)
-    if len(blocks) == 1:
-        log(f"收到 {blocks[0].player} 的翻译请求：{labels(f.key for f in blocks[0].fields)}")
-        set_title(f"翻译中：{blocks[0].display_name}")
-    else:
-        log(f"收到批量翻译请求：{len(blocks)} 人、{total} 个字段")
-        set_title(f"翻译中：{len(blocks)} 人")
+    who = blocks[0].display_name if len(blocks) == 1 else f"{len(blocks)} 人"
+    set_title(f"翻译中：{who}")
 
     names = load_names()
     try:
         outcome = translate_request(blocks, translator, cache, names)
     except TranslateError as error:
-        log(f"翻译失败：{error}")
-        stats.last_error = one_line(error)[:40]
-        respond(clipboard, config, text, format_error(str(error)), ok=False)
-        set_title(stats.idle_title())
+        log(f"{who} 翻译失败：{error}")
+        outbox.put(("error", str(error)))
         return
 
     if outcome.usages:
@@ -702,43 +867,86 @@ def handle(clipboard: Clipboard, config: dict, translator, cache: dict, stats: S
         log(f"人名对照表新增 {outcome.names_added} 条（names.json）。")
     for (player, key), reason in outcome.failed.items():
         log(f"{short_name(player)} 的{FIELD_LABELS.get(key, key)}没翻成：{reason}")
-    log(f"完成 {len(outcome.translated)}/{total} 个字段，用时 {time.monotonic() - started:.1f} 秒。")
+    log(f"{who}：完成 {len(outcome.translated)}/{total} 个字段，用时 {time.monotonic() - started:.1f} 秒。")
 
     if outcome.translated:
-        stats.done += 1
-        stats.last_error = ""
-        respond(clipboard, config, text, format_response(blocks, outcome.translated, outcome.failed), ok=True)
+        pool.add(blocks, outcome.translated)
+        outbox.put(("ready", who))
     else:
-        stats.last_error = "所有字段都没翻成"
         reasons = "；".join(f"{short_name(p)} 的{FIELD_LABELS.get(k, k)}（{v}）" for (p, k), v in outcome.failed.items())
-        respond(clipboard, config, text, format_error("所有字段都没能翻译：" + reasons), ok=False)
-    set_title(stats.idle_title())
+        outbox.put(("error", "所有字段都没能翻译：" + reasons))
 
+
+def deliver(clipboard: Clipboard, config: dict, pool: ReadyPool, kind: str, detail: str) -> None:
+    """只在主线程调用：把整池译文写进剪贴板；池是空的才写报错。"""
+    ok = kind != "error"
+    response, people = pool.response()
+    if ok and not people:
+        return
+    if not ok and people:
+        # 不能拿报错把别人的译文顶掉：照常写回整池，没翻成的那份回游戏再点一次就行
+        log("这份没翻成，先前翻好的译文照常写回剪贴板。")
+    if not is_ours(clipboard.read_text()):
+        log("剪贴板里是你复制的别的东西，没有覆盖。回游戏点档案上的「粘贴」，按 Ctrl+C 再发一次就能拿到。")
+        beep(config, ok)
+        set_title(f"有译文待取：{len(people)} 人（剪贴板被占用）" if people else "等待中 · 上次失败")
+        return
+    try:
+        clipboard.write_text(response if people else format_error(detail))
+    except ClipboardError as error:
+        log(f"写回剪贴板失败：{error}")
+        return
+    beep(config, ok)
+    if people:
+        log(f"译文已写入剪贴板（{'、'.join(people)}），回游戏打开其中任意一份档案，点「粘贴」再按 Ctrl+V。")
+        set_title(f"有译文待粘贴：{len(people)} 人" + ("" if ok else " · 上次失败"))
+    else:
+        log("错误信息已写入剪贴板。")
+        set_title("等待中 · 上次失败")
 
 def run(config: dict) -> None:
     translator = make_translator(config)
     clipboard = Clipboard()
     cache = load_cache()
-    stats = Stats()
+    pool = ReadyPool()
+    requests: queue.Queue[str] = queue.Queue()
+    outbox: queue.Queue[tuple[str, str]] = queue.Queue()
     log(f"翻译接口：{translator.label}；缓存里有 {len(cache)} 条译文，人名对照表有 {len(load_names())} 条。")
     log("等待游戏里的翻译请求……（按 Ctrl+C 退出）")
-    set_title(stats.idle_title())
+    set_title("等待中")
+
+    # 翻译放在后台线程，一次一份；主线程只管剪贴板，所以翻译期间复制的新请求不会漏掉
+    def worker() -> None:
+        while True:
+            text = requests.get()
+            try:
+                handle(config, translator, cache, pool, outbox, text)
+            except Exception as error:  # 写文件失败之类的意外：记下来，助手接着跑
+                log(f"处理请求时出错：{error!r}")
+                outbox.put(("error", "助手内部错误"))
+
+    threading.Thread(target=worker, daemon=True).start()
+    start_key_remap(config)
 
     last_sequence = clipboard.sequence()
     while True:
         time.sleep(0.25)
         sequence = clipboard.sequence()
-        if sequence == last_sequence:
-            continue
-        last_sequence = sequence
-        text = clipboard.read_text()
-        if text and text.lstrip().startswith(HEADER_REQ):
-            try:
-                handle(clipboard, config, translator, cache, stats, text)
-            except Exception as error:  # 写文件失败之类的意外：记下来，助手接着跑
-                log(f"处理请求时出错：{error!r}")
-                stats.last_error = "内部错误"
-                set_title(stats.idle_title())
+        if sequence != last_sequence:
+            last_sequence = sequence
+            text = clipboard.read_text()
+            if text and text.lstrip().startswith(HEADER_REQ):
+                try:
+                    blocks = parse_request(text)
+                    who = "、".join(b.display_name for b in blocks)
+                    fields = sum(len(b.fields) for b in blocks)
+                    log(f"收到 {who} 的翻译请求（{fields} 个字段）" + (f"，前面还有 {requests.qsize()} 份在排队" if requests.qsize() else ""))
+                except ProtocolError:
+                    pass  # 后台线程会再解析一次并回报错误
+                requests.put(text)
+        while not outbox.empty():
+            kind, detail = outbox.get()
+            deliver(clipboard, config, pool, kind, detail)
             last_sequence = clipboard.sequence()  # 自己写回的那次不算新请求
 
 
